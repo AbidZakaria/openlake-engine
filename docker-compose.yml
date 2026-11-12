@@ -1,0 +1,151 @@
+name: openlake
+
+x-lake-env: &lake-env
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-openlake}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-openlake-secret}
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  OPENLAKE_S3_ENDPOINT: http://minio:9000
+  OPENLAKE_BUCKET: ${OPENLAKE_BUCKET:-openlake}
+  OPENLAKE_CATALOG_URI: http://iceberg-rest:8181
+  OPENLAKE_SPARK_MASTER: ${OPENLAKE_SPARK_MASTER:-spark://spark-master:7077}
+  OPENLAKE_DRIVER_MEMORY: ${OPENLAKE_DRIVER_MEMORY:-2g}
+  OPENLAKE_EXECUTOR_MEMORY: ${OPENLAKE_EXECUTOR_MEMORY:-2g}
+  OPENLAKE_EXECUTOR_CORES: ${OPENLAKE_EXECUTOR_CORES:-2}
+  OPENLAKE_SHUFFLE_PARTITIONS: ${OPENLAKE_SHUFFLE_PARTITIONS:-8}
+  OPENLAKE_SCALE_ORDERS: ${OPENLAKE_SCALE_ORDERS:-100000}
+
+services:
+  # --------------------------------------------------------------- storage
+  minio:
+    image: pgsty/minio:RELEASE.2026-06-18T00-00-00Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-openlake}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-openlake-secret}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Creates the bucket before anything tries to write to it.
+  minio-init:
+    image: openlake/spark:latest
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+    command: ["python3", "-m", "openlake", "init-storage"]
+    environment: *lake-env
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+
+  # --------------------------------------------------------------- catalog
+  # Iceberg REST catalog (JDBC/SQLite backend persisted on a volume). It owns
+  # table metadata pointers; MinIO stores data + metadata files.
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.10.0
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-openlake}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-openlake-secret}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      CATALOG_URI: jdbc:sqlite:/home/iceberg/iceberg_catalog.db
+      CATALOG_WAREHOUSE: s3://${OPENLAKE_BUCKET:-openlake}/warehouse
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports:
+      - "8181:8181"
+    volumes:
+      - catalog-data:/home/iceberg
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8181' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # --------------------------------------------------------------- compute
+  spark-master:
+    image: openlake/spark:latest
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      SPARK_MASTER_HOST: spark-master
+      SPARK_NO_DAEMONIZE: "true"
+    ports:
+      - "8080:8080"   # Spark master UI
+      - "7077:7077"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+
+  spark-worker:
+    image: openlake/spark:latest
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      <<: *lake-env
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-3g}
+      SPARK_NO_DAEMONIZE: "true"
+    ports:
+      - "8081:8081"   # Spark worker UI
+    depends_on:
+      - spark-master
+    volumes:
+      - spark-work:/opt/spark/work
+
+  # --------------------------------------------------------------- pipeline
+  # Runs the full lakehouse bootstrap once (idempotent), then exits.
+  # Ad-hoc commands: docker compose run --rm openlake <command>
+  openlake:
+    image: openlake/spark:latest
+    command: ["python3", "-m", "openlake", "bootstrap"]
+    environment: *lake-env
+    ports:
+      - "4041:4040"   # Spark driver UI while a job is running (4041 avoids clashing with other local Spark apps)
+    volumes:
+      - ./data:/opt/openlake/data
+      - ./reports:/opt/openlake/reports
+      - ./benchmarks/results:/opt/openlake/benchmarks/results
+      - ./docs:/opt/openlake/docs
+      - spark-checkpoints:/opt/openlake/checkpoints
+    depends_on:
+      iceberg-rest:
+        condition: service_healthy
+      spark-worker:
+        condition: service_started
+    restart: "no"
+
+  # --------------------------------------------------------------- dashboard
+  # FastAPI + DuckDB. Reads Iceberg tables straight from the REST catalog and
+  # MinIO — no Spark involved on the read path.
+  dashboard:
+    image: openlake/dashboard:latest
+    build:
+      context: .
+      dockerfile: docker/dashboard/Dockerfile
+    environment:
+      <<: *lake-env
+      OPENLAKE_REPORTS_DIR: /app/reports
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./reports:/app/reports:ro
+      - ./benchmarks/results:/app/benchmarks/results:ro
+    depends_on:
+      iceberg-rest:
+        condition: service_healthy
+
+volumes:
+  minio-data:
+  catalog-data:
+  spark-work:
+  spark-checkpoints:

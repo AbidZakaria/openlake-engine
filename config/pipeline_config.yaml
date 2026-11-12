@@ -1,0 +1,230 @@
+# =============================================================================
+# OpenLake Engine — pipeline contract
+#
+# Everything dataset-specific lives here: how raw files map to entities, the
+# Silver data contract (types, keys, renames), the schema-evolution policy,
+# data-quality rules, partitioning and maintenance policy. The Python code is
+# generic — onboarding a new dataset means adding a `source` block, not code.
+# =============================================================================
+
+catalog: lake                   # Spark catalog name bound to the Iceberg REST catalog
+namespaces:
+  bronze: bronze
+  silver: silver
+  gold: gold
+  quarantine: quarantine
+  ops: ops
+  lab: lab
+
+table_properties:               # applied to every managed Iceberg table
+  format-version: "2"
+  write.parquet.compression-codec: zstd
+  # Copy-on-write keeps tables free of delete files, so every reader (DuckDB
+  # included) sees plain Parquet data files. Merge-on-read would make frequent
+  # small updates cheaper at the cost of read-time merging.
+  write.delete.mode: copy-on-write
+  write.update.mode: copy-on-write
+  write.merge.mode: copy-on-write
+  write.metadata.delete-after-commit.enabled: "true"
+  write.metadata.previous-versions-max: "50"
+
+maintenance:
+  snapshot_retention:
+    retain_last: 10             # never expire below this many snapshots
+    max_age_days: 7             # ...and keep everything younger than this
+  orphan_files:
+    older_than_hours: 72        # files younger than this may belong to in-flight writes
+  compaction:
+    min_input_files: 5
+    target_file_size_mb: 128
+
+schema_evolution:
+  # additive  : a column the contract does not know yet
+  # missing   : a contract column absent from the incoming file
+  # type      : value cannot be cast to the contract type (handled by quality)
+  additive: accept              # accept | reject
+  missing_optional: accept      # optional contract columns may be absent
+  missing_required: reject      # required column absent => batch quarantined, change flagged
+
+sources:
+  ecommerce:
+    description: Olist-shaped Brazilian marketplace (customers, sellers, products, orders, items, payments, reviews)
+    raw_prefix: raw/ecommerce
+    entities:
+      # ------------------------------------------------------------------
+      customers:
+        file_pattern: "customers"
+        keys: [customer_id]
+        columns:
+          customer_id: {type: string, required: true}
+          customer_unique_id: {type: string, required: true}
+          customer_zip_code_prefix: {type: string}
+          customer_city: {type: string}
+          customer_state: {type: string, required: true}
+        standardize:
+          customer_city: title
+          customer_state: upper
+          customer_zip_code_prefix: zip5
+        rules:
+          - {name: customer_id_not_null, type: not_null, column: customer_id, severity: error}
+          - {name: customer_unique_id_not_null, type: not_null, column: customer_unique_id, severity: error}
+          - {name: customer_id_unique, type: unique, column: customer_id, severity: warn}
+          - {name: customer_state_valid, type: accepted_values, column: customer_state, values: "@br_states", severity: error}
+          - {name: customer_zip_format, type: regex, column: customer_zip_code_prefix, pattern: "^[0-9]{5}$", severity: warn}
+
+      # ------------------------------------------------------------------
+      sellers:
+        file_pattern: "sellers"
+        keys: [seller_id]
+        columns:
+          seller_id: {type: string, required: true}
+          seller_zip_code_prefix: {type: string}
+          seller_city: {type: string}
+          seller_state: {type: string, required: true}
+        standardize:
+          seller_city: title
+          seller_state: upper
+          seller_zip_code_prefix: zip5
+        rules:
+          - {name: seller_id_not_null, type: not_null, column: seller_id, severity: error}
+          - {name: seller_id_unique, type: unique, column: seller_id, severity: warn}
+          - {name: seller_state_valid, type: accepted_values, column: seller_state, values: "@br_states", severity: error}
+
+      # ------------------------------------------------------------------
+      product_categories:
+        file_pattern: "product_category_name_translation"
+        keys: [product_category_name]
+        columns:
+          product_category_name: {type: string, required: true}
+          product_category_name_english: {type: string, required: true}
+        standardize:
+          product_category_name: snake
+          product_category_name_english: snake
+        rules:
+          - {name: category_not_null, type: not_null, column: product_category_name, severity: error}
+          - {name: category_unique, type: unique, column: product_category_name, severity: warn}
+
+      # ------------------------------------------------------------------
+      products:
+        file_pattern: "products"
+        keys: [product_id]
+        rename:                 # the Olist source misspells "length"
+          product_name_lenght: product_name_length
+          product_description_lenght: product_description_length
+        columns:
+          product_id: {type: string, required: true}
+          product_category_name: {type: string}
+          product_name_length: {type: int}
+          product_description_length: {type: int}
+          product_photos_qty: {type: int}
+          product_weight_g: {type: int}
+          product_length_cm: {type: int}
+          product_height_cm: {type: int}
+          product_width_cm: {type: int}
+        standardize:
+          product_category_name: snake
+        rules:
+          - {name: product_id_not_null, type: not_null, column: product_id, severity: error}
+          - {name: product_id_unique, type: unique, column: product_id, severity: warn}
+          - {name: product_weight_non_negative, type: range, column: product_weight_g, min: 0, max: 100000, severity: error}
+          - {name: product_category_known, type: foreign_key, column: product_category_name, ref_table: product_categories, ref_column: product_category_name, severity: warn}
+
+      # ------------------------------------------------------------------
+      orders:
+        file_pattern: "orders"
+        keys: [order_id]
+        partition_by: ["months(order_purchase_timestamp)"]
+        columns:
+          order_id: {type: string, required: true}
+          customer_id: {type: string, required: true}
+          order_status: {type: string, required: true}
+          order_purchase_timestamp: {type: timestamp, required: true}
+          order_approved_at: {type: timestamp}
+          order_delivered_carrier_date: {type: timestamp}
+          order_delivered_customer_date: {type: timestamp}
+          order_estimated_delivery_date: {type: timestamp}
+        evolution_hints:        # types to use when these columns first appear
+          delivery_priority: string
+        standardize:
+          order_status: lower
+        rules:
+          - {name: order_id_not_null, type: not_null, column: order_id, severity: error}
+          - {name: customer_id_not_null, type: not_null, column: customer_id, severity: error}
+          - {name: purchase_ts_not_null, type: not_null, column: order_purchase_timestamp, severity: error}
+          - {name: order_status_valid, type: accepted_values, column: order_status, values: [created, approved, invoiced, processing, shipped, delivered, canceled, unavailable], severity: error}
+          - {name: purchase_ts_not_in_future, type: not_future, column: order_purchase_timestamp, severity: error}
+          - {name: approved_after_purchase, type: ordered, columns: [order_purchase_timestamp, order_approved_at], severity: warn}
+          - {name: delivered_after_purchase, type: ordered, columns: [order_purchase_timestamp, order_delivered_customer_date], severity: warn}
+          - {name: order_customer_exists, type: foreign_key, column: customer_id, ref_table: customers, ref_column: customer_id, severity: warn}
+
+      # ------------------------------------------------------------------
+      order_items:
+        file_pattern: "order_items"
+        keys: [order_id, order_item_id]
+        columns:
+          order_id: {type: string, required: true}
+          order_item_id: {type: int, required: true}
+          product_id: {type: string, required: true}
+          seller_id: {type: string, required: true}
+          shipping_limit_date: {type: timestamp}
+          price: {type: double, required: true}
+          freight_value: {type: double}
+        rules:
+          - {name: item_order_id_not_null, type: not_null, column: order_id, severity: error}
+          - {name: item_product_not_null, type: not_null, column: product_id, severity: error}
+          - {name: item_seller_not_null, type: not_null, column: seller_id, severity: error}
+          - {name: item_price_positive, type: range, column: price, min: 0.01, severity: error}
+          - {name: item_freight_non_negative, type: range, column: freight_value, min: 0, severity: error}
+          - {name: item_order_exists, type: foreign_key, column: order_id, ref_table: orders, ref_column: order_id, severity: warn}
+          - {name: item_product_exists, type: foreign_key, column: product_id, ref_table: products, ref_column: product_id, severity: warn}
+          - {name: item_seller_exists, type: foreign_key, column: seller_id, ref_table: sellers, ref_column: seller_id, severity: warn}
+
+      # ------------------------------------------------------------------
+      order_payments:
+        file_pattern: "order_payments"
+        keys: [order_id, payment_sequential]
+        columns:
+          order_id: {type: string, required: true}
+          payment_sequential: {type: int, required: true}
+          payment_type: {type: string, required: true}
+          payment_installments: {type: int}
+          payment_value: {type: double, required: true}
+        standardize:
+          payment_type: snake
+        rules:
+          - {name: payment_order_not_null, type: not_null, column: order_id, severity: error}
+          - {name: payment_value_non_negative, type: range, column: payment_value, min: 0, severity: error}
+          - {name: payment_type_valid, type: accepted_values, column: payment_type, values: [credit_card, boleto, voucher, debit_card, not_defined], severity: error}
+          - {name: installments_range, type: range, column: payment_installments, min: 0, max: 24, severity: warn}
+          - {name: payment_order_exists, type: foreign_key, column: order_id, ref_table: orders, ref_column: order_id, severity: warn}
+
+      # ------------------------------------------------------------------
+      order_reviews:
+        file_pattern: "order_reviews"
+        keys: [review_id, order_id]
+        columns:
+          review_id: {type: string, required: true}
+          order_id: {type: string, required: true}
+          review_score: {type: int, required: true}
+          review_comment_title: {type: string}
+          review_comment_message: {type: string}
+          review_creation_date: {type: timestamp}
+          review_answer_timestamp: {type: timestamp}
+        rules:
+          - {name: review_id_not_null, type: not_null, column: review_id, severity: error}
+          - {name: review_score_range, type: range, column: review_score, min: 1, max: 5, severity: error}
+          - {name: review_answer_after_creation, type: ordered, columns: [review_creation_date, review_answer_timestamp], severity: warn}
+          - {name: review_order_exists, type: foreign_key, column: order_id, ref_table: orders, ref_column: order_id, severity: warn}
+
+# Processing order: referenced entities first so foreign-key checks see them.
+entity_order: [product_categories, customers, sellers, products, orders, order_items, order_payments, order_reviews]
+
+value_sets:
+  br_states: [AC, AL, AM, AP, BA, CE, DF, ES, GO, MA, MG, MS, MT, PA, PB, PE, PI, PR, RJ, RN, RO, RR, RS, SC, SE, SP, TO]
+
+gold:
+  partition_by:
+    fact_orders: ["months(order_date)"]
+    fact_order_items: ["months(order_date)"]
+    fact_payments: ["months(order_date)"]
+    daily_revenue: ["months(order_date)"]

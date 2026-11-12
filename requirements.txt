@@ -1,0 +1,9 @@
+# Runtime dependencies of the pipeline image (PySpark itself ships with the Spark image).
+numpy==2.2.6
+pandas==2.3.3
+pyarrow==21.0.0
+pyyaml==6.0.2
+boto3==1.40.40
+duckdb==1.4.1
+requests==2.32.5
+pytest==8.4.2

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openlake-engine"
+version = "1.0.0"
+description = "A containerized Apache Iceberg lakehouse: MinIO + Iceberg REST catalog + PySpark + DuckDB, organised as a medallion architecture."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Abid Zakaria" }]
+
+[project.scripts]
+openlake = "openlake.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["openlake*"]
+
+[tool.setuptools.package-data]
+"openlake.analytics" = ["queries/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "spark: needs a local PySpark + Iceberg runtime (runs inside the openlake image or CI)",
+    "integration: needs the running docker compose stack",
+]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501", "B008"]
