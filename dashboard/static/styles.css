@@ -205,8 +205,8 @@ textarea.editor {
 .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 select { background: var(--deep); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font: inherit; font-size: 13.5px; }
 
-.notice { border: 1px solid var(--line); border-left: 3px solid var(--ops); border-radius: 6px; padding: 10px 14px; color: #C7D6DD; font-size: 14px; background: rgba(95, 168, 196, 0.06); }
-.notice.error { border-left-color: var(--quarantine); background: rgba(224, 112, 95, 0.07); }
+.notice { border: 1px solid rgba(95, 168, 196, 0.35); border-radius: 6px; padding: 10px 14px; color: #C7D6DD; font-size: 14px; background: rgba(95, 168, 196, 0.06); }
+.notice.error { border-color: rgba(224, 112, 95, 0.45); background: rgba(224, 112, 95, 0.07); }
 .loading { color: var(--muted); padding: 40px 0; }
 
 .chart-box { position: relative; height: 280px; }
